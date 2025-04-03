@@ -6,3 +6,4 @@ fairseq
 tensorboardX
 librosa
 soundfile
+sox

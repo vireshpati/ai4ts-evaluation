@@ -1,12 +1,13 @@
+# train.py
 import os
-import subprocess
 import argparse
 import torch
+import subprocess
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train a speech commands classification model")
     
-    # Add command-line arguments
     parser.add_argument('--num-classes', type=int, default=10, choices=[10, 35],
                         help='Number of classes to use (10 or 35)')
     parser.add_argument('--max-epochs', type=int, default=20,
@@ -25,32 +26,23 @@ def main():
     pipeline_dir = os.path.dirname(os.path.realpath(__file__))
     user_dir = pipeline_dir
     
-    # Use provided data directory or default to data/speech_commands
     data_dir = args.data_dir if args.data_dir else os.path.join(pipeline_dir, "data", "speech_commands")
-    
-    # Verify data directory exists
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
     
-    print(f"Using data from: {data_dir}")
+    # Device check
+    if not torch.cuda.is_available() and not torch.backends.mps.is_available():
+        raise RuntimeError("No GPU/MPS available. This task is GPU-intensive.")
     
-    # Determine device
-    if torch.cuda.is_available():
-        print("Using CUDA GPU for training")
-    elif torch.backends.mps.is_available():
-        print("Using MPS (Apple Silicon GPU) for training")
-        # Set environment variable for MPS
-        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-    else:
-        raise RuntimeError("No GPU available. This task requires GPU acceleration.")
+    save_dir = os.path.join(pipeline_dir, f"checkpoints_speech_{args.num_classes}class")
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Form the fairseq-train command
     cmd = [
         "fairseq-train",
-        "--user-dir", user_dir,
+        "--user-dir", user_dir,                  # to find custom tasks/models
         "--task", "speech_commands",
         "--data", data_dir,
-        "--arch", "simple_linear_transformer_arch",
+        "--arch", "simple_linear_transformer_arch",  # or "vgg_transformer_sc10"
         "--criterion", "cross_entropy",
         "--classification-head-name", "speech_commands_head",
         "--optimizer", "adam",
@@ -58,20 +50,17 @@ def main():
         "--batch-size", str(args.batch_size),
         "--max-epoch", str(args.max_epochs),
         "--num-classes", str(args.num_classes),
-        "--max-audio-frames", "16000",  # 1 second of audio at 16kHz
-        "--save-dir", os.path.join(pipeline_dir, f"checkpoints_speech_{args.num_classes}class"),
+        "--max-audio-frames", "16000", 
+        "--save-dir", save_dir,
         "--valid-subset", "valid",
         "--save-interval", "1",
         "--log-interval", "10",
     ]
     
-    # Add debug flag if requested
     if args.debug:
         cmd.append("--debug")
-        print("Running in debug mode with smaller dataset")
     
-    print(f"Training Speech Commands classifier with {args.num_classes} classes")
-    print(f"Command: {' '.join(cmd)}")
+    print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd)
 
 if __name__ == "__main__":
