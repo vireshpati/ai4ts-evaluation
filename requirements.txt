@@ -4,3 +4,5 @@ numpy
 scikit-learn
 fairseq
 tensorboardX
+librosa
+soundfile

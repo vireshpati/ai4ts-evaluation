@@ -7,21 +7,26 @@ from torch.utils.data import Dataset, DataLoader
 from argparse import Namespace
 from fairseq.tasks import FairseqTask, register_task
 from fairseq.data import FairseqDataset
+import numpy as np
+from fairseq.criterions import CRITERION_REGISTRY
+from omegaconf import OmegaConf
+import torch.nn.functional as F
 
 @register_task('speech_commands')
 class SpeechCommandsTask(FairseqTask):
     """
-    A Fairseq Task for classifying 1-second audio commands into 10 classes.
-    This can be extended to 35 classes or other splits as needed.
+    A Fairseq Task for classifying audio commands.
+    Supports both 10-class and 35-class configurations.
     """
 
     @staticmethod
     def add_args(parser):
-        # Add task-specific arguments
         parser.add_argument('--data', type=str, help='Path to the SpeechCommands dataset root')
+        parser.add_argument('--classification-head-name', type=str, default='speech_commands_head', help='Name for the classification head')
         parser.add_argument('--num-classes', type=int, default=10, help='Number of target classes')
         parser.add_argument('--max-audio-frames', type=int, default=16000,
                             help='Max number of audio samples or frames in input (for raw waveforms)')
+        parser.add_argument('--debug', action='store_true', help='Enable debug mode')
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -37,15 +42,28 @@ class SpeechCommandsTask(FairseqTask):
         self.args = args
         self.num_classes = args.num_classes
 
-        # Define class labels for 10 keywords (example subset)
-        self.labels = ["yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"]
-        # A fallback if user wants 35 or other sets, they'd extend or dynamically read them
-        if self.num_classes != 10:
-            raise ValueError("Currently only a 10-class subset is hardcoded. Adjust accordingly.")
+        # Define class labels
+        # 10-class subset (common commands)
+        self.labels_10 = ["yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"]
+        
+        # Full 35-class set (all commands)
+        self.labels_35 = [
+            "yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go",
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+            "bed", "bird", "cat", "dog", "happy", "house", "marvin", "sheila", "tree", "wow",
+            "backward", "forward", "follow", "learn", "visual"
+        ]
 
-        # You could define a dictionary or label mapping if needed
+        # Select labels based on num_classes
+        if self.num_classes == 10:
+            self.labels = self.labels_10
+        elif self.num_classes == 35:
+            self.labels = self.labels_35
+        else:
+            raise ValueError(f"Number of classes must be 10 or 35, got {self.num_classes}")
+
+        # Define label mapping
         self.label_to_index = {lab: i for i, lab in enumerate(self.labels)}
-
         self.datasets = {}
 
     def load_dataset(self, split: str, **kwargs):
@@ -56,13 +74,20 @@ class SpeechCommandsTask(FairseqTask):
         if split not in ['train', 'valid', 'test']:
             raise ValueError(f"Unknown split {split}. Must be one of: train, valid, test.")
 
-        # We'll rely on torchaudio.datasets.SPEECHCOMMANDS or a custom approach
+        # Use our dataset wrapper for SpeechCommands
         dataset = SpeechCommandsWrapper(
             root=self.args.data,
             subset=split,
             label_list=self.labels,
-            max_audio_frames=self.args.max_audio_frames
+            max_audio_frames=self.args.max_audio_frames,
+            debug=self.args.debug
         )
+        
+        # Set device based on CUDA availability
+        if torch.cuda.is_available():
+            dataset.set_device(torch.device("cuda"))
+        elif torch.backends.mps.is_available():
+            dataset.set_device(torch.device("mps"))
 
         self.datasets[split] = dataset
 
@@ -87,105 +112,143 @@ class SpeechCommandsTask(FairseqTask):
         """
         return (self.args.max_audio_frames, )
 
+    def build_criterion(self, cfg):
+        """
+        Build the criterion for the task.
+        """
+        from fairseq.criterions import CRITERION_REGISTRY
+        # Create a new config with the required fields
+        criterion_cfg = OmegaConf.create({
+            "criterion": "cross_entropy",
+            "sentence_avg": True,
+            "report_accuracy": True
+        })
+        return CRITERION_REGISTRY['cross_entropy'](criterion_cfg, self)
+        
+    def compute_metrics(self, logits, targets):
+        """
+        Compute metrics for the task.
+        """
+        # Calculate accuracy
+        preds = logits.argmax(dim=-1)
+        correct = (preds == targets).sum().item()
+        total = targets.size(0)
+        accuracy = correct / total if total > 0 else 0.0
+        
+        # Calculate loss
+        loss = F.cross_entropy(logits, targets)
+        
+        return {
+            'loss': loss,
+            'accuracy': accuracy,
+            'ntokens': total,
+            'nsentences': total,
+            'sample_size': total
+        }
+
 class SpeechCommandsWrapper(FairseqDataset):
     """
-    A minimal wrapper around torchaudio's SPEECHCOMMANDS for the 10-class subset.
-    We will store (waveform, label) pairs, and pad them in collater.
+    A wrapper around torchaudio's SPEECHCOMMANDS that properly uses the official dataset split.
+    Uses the official validation_list.txt and testing_list.txt files for splits.
     """
 
-    def __init__(self, root, subset, label_list, max_audio_frames=16000):
+    def __init__(self, root, subset, label_list, max_audio_frames=16000, debug=False):
         super().__init__()
         self.root = root
         self.subset = subset
         self.labels = label_list
         self.max_audio_frames = max_audio_frames
-
-        # Use torchaudio's built-in dataset
-        base_ds = torchaudio.datasets.SPEECHCOMMANDS(root=self.root, download=True)
-        # We'll manually filter to create splits
-        # The default dataset doesn't have a built-in "train"/"valid"/"test"
-        # but includes validation_list and testing_list files
-        # For minimal code, let's create a quick mapping
-        val_list = os.path.join(root, 'validation_list.txt')
-        test_list = os.path.join(root, 'testing_list.txt')
-        with open(val_list, 'r') as f:
-            val_paths = set(line.strip() for line in f)
-        with open(test_list, 'r') as f:
-            test_paths = set(line.strip() for line in f)
-
-        data = []
-        for waveform, sr, label, spkid, uttid in base_ds:
-            relpath = os.path.relpath(base_ds._walker[-1], root) if base_ds._walker else ''
-            # Actually, torchaudio doesn't store partial paths in the same manner,
-            # we can replicate logic: label/filename for each item
-            # But let's do a simpler approach: we check if label is in the 10-class subset
-            if label not in self.labels:
-                continue
-
-            # Determine if example belongs to this split
-            # e.g. if rel_path in val_list => 'valid', test_list => 'test', else 'train'
-            # We'll guess the path from base_ds._path
-            # For simplicity, let's do it by reading the official approach:
-            # if it's in test_list => 'test'
-            # if it's in val_list => 'valid'
-            # else => 'train'
-            # We'll reconstruct the path portion from label/spkid/fname
-            # but let's skip details. We'll check subset below:
-
-            # We can approximate a method:
-            #   sampleid = label + '/' + 'some.wav' => check if in val_list/test_list
-            # We'll do a hack: speechcommands dataset has .samples list from 0.13.0 onwards
-            # For minimal code, let's skip robust path checks and pretend the user manually splits data.
-
-            # We'll do an approach: if subset=train => all data except val/test, etc.
-            # This is minimal code, not robust. For real usage, rely on official approach or folder structure.
-
-            # Actually let's do a random approach for demonstration. Not best practice:
-            # (In real code, you'd use the official lists to assign split.)
-            # We'll keep it simple here for demonstration only:
-            pass
-
-        # For demonstration, let's read entire dataset in memory and
-        # randomly split 80/10/10 for train/valid/test
-        # A real approach would parse the official validation_list.txt / test_list.txt
-        all_data = []
-        base_ds2 = torchaudio.datasets.SPEECHCOMMANDS(root=self.root, download=True)
-        for (waveform, sr, lab, spk, uttid) in base_ds2:
-            if lab in self.labels:
-                all_data.append((waveform, sr, lab))
-
-        # Shuffle once
-        random.seed(42)
-        random.shuffle(all_data)
-        n = len(all_data)
-        n_train = int(0.8 * n)
-        n_val = int(0.1 * n)
-        train_data = all_data[:n_train]
-        valid_data = all_data[n_train:n_train+n_val]
-        test_data = all_data[n_train+n_val:]
-
-        # Assign data based on self.subset
-        if self.subset == 'train':
-            subset_data = train_data
-        elif self.subset == 'valid':
-            subset_data = valid_data
+        self.debug = debug
+        self.device = None  # Will be set by the task
+        
+        # Read validation and test lists
+        val_list_path = os.path.join(root, 'validation_list.txt')
+        test_list_path = os.path.join(root, 'testing_list.txt')
+        
+        validation_files = set()
+        testing_files = set()
+        
+        if os.path.exists(val_list_path):
+            with open(val_list_path, 'r') as f:
+                validation_files = set(line.strip() for line in f)
         else:
-            subset_data = test_data
-
-        # Convert to internal list
+            raise FileNotFoundError(f"Validation list not found at {val_list_path}")
+            
+        if os.path.exists(test_list_path):
+            with open(test_list_path, 'r') as f:
+                testing_files = set(line.strip() for line in f)
+        else:
+            raise FileNotFoundError(f"Testing list not found at {test_list_path}")
+            
+        # Load the samples based on the current split
         self.samples = []
-        for (waveform, sr, lab) in subset_data:
-            if sr != 16000:
-                # Optionally resample if needed
-                waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=16000)
-                sr = 16000
-            self.samples.append((waveform.squeeze(0), self.labels.index(lab)))  # (waveform, class_idx)
+        self.sizes = []  # Store sizes for each sample
+        
+        # Process each directory of interest (each label)
+        for label in self.labels:
+            label_dir = os.path.join(root, label)
+            if not os.path.isdir(label_dir):
+                print(f"Warning: Label directory {label_dir} not found. Skipping.")
+                continue
+                
+            # Process each audio file in the label directory
+            for filename in os.listdir(label_dir):
+                if not filename.endswith('.wav'):
+                    continue
+                    
+                file_path = os.path.join(label, filename)  # Relative path as stored in list files
+                
+                # Determine which split this file belongs to
+                is_val = file_path in validation_files
+                is_test = file_path in testing_files
+                
+                # Only add files that belong to the requested split
+                if (self.subset == 'valid' and is_val) or \
+                   (self.subset == 'test' and is_test) or \
+                   (self.subset == 'train' and not is_val and not is_test):
+                    
+                    # Load the audio file
+                    audio_path = os.path.join(root, file_path)
+                    waveform, sample_rate = torchaudio.load(audio_path)
+                    
+                    # Ensure consistent sample rate
+                    if sample_rate != 16000:
+                        waveform = torchaudio.functional.resample(waveform, orig_freq=sample_rate, new_freq=16000)
+                    
+                    # Ensure expected shape and length
+                    waveform = waveform.squeeze(0)  # Convert from [1, T] to [T]
+                    
+                    # Store size (length) of the audio
+                    self.sizes.append(waveform.size(0))
+                    
+                    # Add to samples collection
+                    self.samples.append((waveform, self.labels.index(label)))
+                    
+                    # In debug mode, limit the number of samples
+                    if self.debug and len(self.samples) >= 100:
+                        break
+            
+            # In debug mode, limit the number of labels
+            if self.debug and len(self.samples) >= 100:
+                break
 
+        # Convert sizes to numpy array for faster access
+        self.sizes = np.array(self.sizes)
+        print(f"Loaded {len(self.samples)} samples for {subset} split")
+        
+    def set_device(self, device):
+        """Set the device for the dataset"""
+        self.device = device
+        
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
-        return self.samples[index]
+        waveform, label = self.samples[index]
+        # Move tensors to the same device as the model if needed
+        if self.device is not None:
+            waveform = waveform.to(self.device)
+        return waveform, label
 
     def collater(self, samples):
         """
@@ -202,11 +265,57 @@ class SpeechCommandsWrapper(FairseqDataset):
         for i, (wave, lbl) in enumerate(samples):
             batch_wave[i, :wave.size(0)] = wave
             batch_label[i] = lbl
-        return {
+        
+        # Calculate total number of tokens (audio frames)
+        ntokens = sum(lengths)
+        
+        # Create the sample dictionary in the format expected by Fairseq
+        sample = {
             'id': torch.arange(len(samples)),
             'net_input': {
                 'src_tokens': batch_wave,    # shape [B, T]
                 'src_lengths': torch.tensor(lengths, dtype=torch.long)
             },
-            'target': batch_label
+            'target': batch_label,
+            'ntokens': ntokens,  # Add this field for the criterion
+            'nsentences': len(samples)  # Add this field for the criterion
         }
+        
+        return sample
+
+    def size(self, index):
+        """Return an example's size as a float or tuple."""
+        return self.sizes[index]
+
+    def num_tokens(self, index):
+        """Return the number of tokens in a sample. This value is used to enforce max-tokens during batching."""
+        return self.sizes[index]
+        
+    def ordered_indices(self):
+        """Return an ordered list of indices. Batches will be constructed based on this order."""
+        # Sort by audio length for efficient batching
+        return np.argsort(self.sizes)
+        
+    @property
+    def supports_prefetch(self):
+        """Whether this dataset supports prefetching."""
+        return False
+        
+    def filter_indices_by_size(self, indices, max_sizes):
+        """Filter a list of sample indices. Remove those that are longer than specified in max_sizes."""
+        if isinstance(max_sizes, int):
+            max_sizes = [max_sizes]
+            
+        if not isinstance(max_sizes, (list, tuple)):
+            return indices, []
+            
+        ignored = []
+        for idx in indices.tolist():
+            size = self.size(idx)
+            if size > max_sizes[0]:
+                ignored.append(idx)
+                
+        if len(ignored) > 0:
+            indices = np.array([idx for idx in indices.tolist() if idx not in ignored])
+            
+        return indices, ignored

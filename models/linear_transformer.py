@@ -8,7 +8,7 @@ from fairseq.models import BaseFairseqModel, register_model, register_model_arch
 from fairseq.modules import LayerNorm
 
 ##############################
-# Minimal linear attention
+# linear attention and Transformer encoder layer
 ##############################
 class LinearAttention(nn.Module):
     """
@@ -41,7 +41,7 @@ class LinearAttention(nn.Module):
         k = F.elu(k, inplace=False) + 1
         # possibly mask (not shown here for minimal code)
         # sum_{time} k_i * v_i
-        kv = torch.einsum("bthd,bthd->bhdd", k, v)  # shape [B, H, d, d]
+        kv = torch.einsum("bthd,bthe->bhde", k, v)  # shape [B, H, d, d]
         # out = q * (k^T * v) / (q * sum(k^T))
         # but more simply:
         denominator = torch.einsum("bthd,bhd->bth", q, k.sum(dim=1))  # [B,H,T]
@@ -52,6 +52,33 @@ class LinearAttention(nn.Module):
         out = self.out_proj(out)
         return out
 
+class LinearTransformerEncoderLayer(nn.Module):
+    def __init__(self, embed_dim, ffn_dim, num_heads, dropout=0.1):
+        super().__init__()
+        self.attn = LinearAttention(embed_dim, num_heads)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, ffn_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Self-attn
+        residual = x
+        x_attn = self.attn(x)  # shape [B,T,embed_dim]
+        x = residual + self.dropout(x_attn)
+        x = self.norm1(x)
+        # FFN
+        residual = x
+        x_ffn = self.ffn(x)
+        x = residual + self.dropout(x_ffn)
+        x = self.norm2(x)
+        return x
+    
 ##############################
 # Model
 ##############################
@@ -96,35 +123,70 @@ class SimpleLinearTransformer(BaseFairseqModel):
 
     def forward(self, src_tokens, src_lengths=None, classification_head_name=None, **kwargs):
         """
-        src_tokens: shape [B, T], raw waveforms or [B, T, feats].
-        If raw waveforms => we might do an input projection to embed_dim.
-        For minimal code, assume we do it outside or in first layer.
+        src_tokens: shape [B, T] or [B, T, C]
+        Returns: tuple of (logits, None) where logits has shape [B, num_classes]
         """
+        # Get features from encoder
+        x = src_tokens  # [B, T] or [B, T, C]
+        
+        # Project if needed
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)  # [B,T,1]
+            if not hasattr(self, 'input_proj'):
+                self.input_proj = nn.Linear(1, self.embed_dim).to(x.device)
+            x = self.input_proj(x)
+        elif x.dim() == 3 and x.size(2) != self.embed_dim:
+            if not hasattr(self, 'input_proj'):
+                self.input_proj = nn.Linear(x.size(2), self.embed_dim).to(x.device)
+            x = self.input_proj(x)
+
+        # Pass through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+        x = self.layer_norm(x)  # [B,T,embed_dim]
+
+        # For classification, use mean pooling over time dimension
+        x = x.mean(dim=1)  # [B, embed_dim]
+
+        # Pass through classification head if requested
+        if classification_head_name is not None:
+            x = self.classification_heads[classification_head_name](x)  # [B, num_classes]
+        
+        # Return in the format expected by Fairseq's cross entropy criterion
+        return x, None
+
+    def extract_features(self, src_tokens, src_lengths=None, **kwargs):
+        """Extract features before classification head"""
         # If shape is [B,T], we project to [B,T,embed_dim]
         if src_tokens.dim() == 2:
-            # raw waveforms => project to embed_dim
             src_tokens = src_tokens.unsqueeze(-1)  # [B,T,1]
             proj = nn.Linear(1, self.embed_dim).to(src_tokens.device)
             src_tokens = proj(src_tokens)
         elif src_tokens.dim() == 3:
-            # we assume second dim is T, third is feature dim
             if src_tokens.size(2) != self.embed_dim:
-                # lazy creation of a projection layer if needed
                 proj = nn.Linear(src_tokens.size(2), self.embed_dim).to(src_tokens.device)
                 src_tokens = proj(src_tokens)
-        else:
-            raise ValueError("Unsupported input shape for SimpleLinearTransformer")
 
         x = src_tokens  # [B, T, embed_dim]
         # pass through layers
         for layer in self.layers:
             x = layer(x)
         x = self.layer_norm(x)  # [B,T,embed_dim]
-
-        # The classification head uses the 'CLS' position or average pool
-        # We'll do a quick approach: take x[:,0,:] as the representation
-        # The task can pass classification_head_name to request logits
         return x, None
+
+    def get_normalized_probs_scriptable(self, net_output, log_probs, sample=None):
+        """Get normalized probabilities (or log probs) from a net's output."""
+        logits = net_output[0]
+        if log_probs:
+            return F.log_softmax(logits, dim=-1)
+        else:
+            return F.softmax(logits, dim=-1)
+
+    def classification_heads_forward(self, features, head_name):
+        # features shape: [B,T,embed_dim], we take e.g. x[:,0,:]
+        cls_repr = features[:,0,:]  # Use first token as CLS token
+        head = self.classification_heads[head_name]
+        return head(cls_repr)
 
     def register_classification_head(self, name, num_classes):
         # minimal approach: store a linear layer in a dict
@@ -134,38 +196,15 @@ class SimpleLinearTransformer(BaseFairseqModel):
             self.classification_heads = nn.ModuleDict()
         self.classification_heads[name] = nn.Linear(self.embed_dim, num_classes)
 
-    def classification_heads_forward(self, features, head_name):
-        # features shape: [B,T,embed_dim], we take e.g. x[:,0,:]
-        cls_repr = features[:,0,:]
-        head = self.classification_heads[head_name]
-        return head(cls_repr)
-
-class LinearTransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, ffn_dim, num_heads, dropout=0.1):
-        super().__init__()
-        self.attn = LinearAttention(embed_dim, num_heads)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, ffn_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, embed_dim),
-        )
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # Self-attn
-        residual = x
-        x_attn = self.attn(x)  # shape [B,T,embed_dim]
-        x = residual + self.dropout(x_attn)
-        x = self.norm1(x)
-        # FFN
-        residual = x
-        x_ffn = self.ffn(x)
-        x = residual + self.dropout(x_ffn)
-        x = self.norm2(x)
-        return x
+    def to_device(self, device):
+        """Move model to specified device"""
+        self.input_proj = self.input_proj.to(device)
+        self.layers = self.layers.to(device)
+        self.layer_norm = self.layer_norm.to(device)
+        if hasattr(self, 'classification_heads'):
+            for head in self.classification_heads.values():
+                head = head.to(device)
+        return self
 
 @register_model_architecture("simple_linear_transformer", "simple_linear_transformer_arch")
 def base_architecture(args):
@@ -174,3 +213,4 @@ def base_architecture(args):
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 512)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
     args.dropout = getattr(args, "dropout", 0.1)
+
